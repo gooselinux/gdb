@@ -1,0 +1,69 @@
+gdb/linux-nat.c:
+- Workaround RHEL-5 kernels for detaching SIGSTOPped processes (BZ 498595).
+
+Index: gdb-7.0.50.20100115/gdb/elfread.c
+===================================================================
+--- gdb-7.0.50.20100115.orig/gdb/elfread.c	2010-01-15 22:19:28.000000000 +0100
++++ gdb-7.0.50.20100115/gdb/elfread.c	2010-01-15 22:19:34.000000000 +0100
+@@ -582,7 +582,7 @@ elf_symtab_read (struct objfile *objfile
+ #define BUILD_ID_VERBOSE_NONE 0
+ #define BUILD_ID_VERBOSE_FILENAMES 1
+ #define BUILD_ID_VERBOSE_BINARY_PARSE 2
+-static int build_id_verbose = BUILD_ID_VERBOSE_FILENAMES;
++static int build_id_verbose = BUILD_ID_VERBOSE_NONE;
+ static void
+ show_build_id_verbose (struct ui_file *file, int from_tty,
+ 		       struct cmd_list_element *c, const char *value)
+@@ -1659,8 +1659,10 @@ find_separate_debug_file_by_buildid (str
+       /* Prevent looping on a stripped .debug file.  */
+       if (build_id_name != NULL && strcmp (build_id_name, objfile->name) == 0)
+         {
++#if 0 /* RHEL-5 backward behavior compatibility.  */
+ 	  warning (_("\"%s\": separate debug info file has no debug info"),
+ 		   build_id_name);
++#endif
+ 	  xfree (build_id_name);
+ 	}
+       else if (build_id_name != NULL)
+Index: gdb-7.0.50.20100115/gdb/corelow.c
+===================================================================
+--- gdb-7.0.50.20100115.orig/gdb/corelow.c	2010-01-15 22:19:27.000000000 +0100
++++ gdb-7.0.50.20100115/gdb/corelow.c	2010-01-15 22:19:34.000000000 +0100
+@@ -294,7 +294,7 @@ add_to_thread_list (bfd *abfd, asection 
+     inferior_ptid = ptid;			 /* Yes, make it current */
+ }
+ 
+-static int build_id_core_loads = 1;
++static int build_id_core_loads = 0;
+ 
+ static void
+ build_id_locate_exec (int from_tty)
+Index: gdb-7.0.50.20100115/gdb/linux-nat.c
+===================================================================
+--- gdb-7.0.50.20100115.orig/gdb/linux-nat.c	2010-01-15 22:19:27.000000000 +0100
++++ gdb-7.0.50.20100115/gdb/linux-nat.c	2010-01-15 22:19:55.000000000 +0100
+@@ -1768,8 +1768,22 @@ GPT: lwp %s had signal %s, but it is in 
+ 			    target_signal_to_string (signo));
+     }
+ 
+-  if (*status == 0 && GET_PID (lp->ptid) == pid_was_stopped)
+-    *status = W_STOPCODE (SIGSTOP);
++  /* Workaround RHEL-5 kernel which has unreliable PTRACE_DETACH, SIGSTOP (that
++     many TIDs are left unstopped).  See RH Bug 496732.  */
++  if (GET_PID (lp->ptid) == pid_was_stopped)
++    {
++      int err;
++
++      errno = 0;
++      err = kill_lwp (GET_LWP (lp->ptid), SIGSTOP);
++      if (debug_linux_nat)
++	{
++	  fprintf_unfiltered (gdb_stdlog,
++			      "SC:  lwp kill %d %s\n",
++			      err,
++			      errno ? safe_strerror (errno) : "ERRNO-OK");
++	}
++    }
+ 
+   return 0;
+ }
