@@ -1,0 +1,114 @@
+--- ./gdb/testsuite/gdb.cp/infcall-dlopen-lib.cc	1970-01-01 01:00:00.000000000 +0100
++++ ./gdb/testsuite/gdb.cp/infcall-dlopen-lib.cc	2010-12-10 14:19:29.000000000 +0100
+@@ -0,0 +1,16 @@
++/* This testcase is part of GDB, the GNU debugger.
++
++   Copyright 2010 Free Software Foundation, Inc.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
+--- ./gdb/testsuite/gdb.cp/infcall-dlopen.cc	1970-01-01 01:00:00.000000000 +0100
++++ ./gdb/testsuite/gdb.cp/infcall-dlopen.cc	2010-12-10 14:19:29.000000000 +0100
+@@ -0,0 +1,37 @@
++/* This testcase is part of GDB, the GNU debugger.
++
++   Copyright 2010 Free Software Foundation, Inc.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++#include <dlfcn.h>
++#include <stddef.h>
++
++int
++openlib (const char *filename)
++{
++  void *h = dlopen (filename, RTLD_LAZY);
++
++  if (h == NULL)
++    return 0;
++  if (dlclose (h) != 0)
++    return 0;
++  return 1;
++}
++
++int
++main (void)
++{
++  return 0;
++}
+--- ./gdb/testsuite/gdb.cp/infcall-dlopen.exp	1970-01-01 01:00:00.000000000 +0100
++++ ./gdb/testsuite/gdb.cp/infcall-dlopen.exp	2010-12-10 14:19:55.000000000 +0100
+@@ -0,0 +1,52 @@
++# Copyright 2010 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++if {[skip_shlib_tests]} {
++    return 0
++}
++
++if [get_compiler_info not-used] {
++    return -1
++}
++
++set testfile "infcall-dlopen"
++set srcmainfile ${testfile}.cc
++set srclibfile ${testfile}-lib.cc
++set executable ${testfile}
++set libfile ${objdir}/${subdir}/${executable}.so
++set objfile ${objdir}/${subdir}/${executable}.o
++set binfile ${objdir}/${subdir}/${executable}
++
++# Use completely arbitrary file for $libfile source.
++if { [gdb_compile_shlib ${srcdir}/${subdir}/${srclibfile} ${libfile} {debug c++}] != ""
++     || [gdb_compile ${srcdir}/${subdir}/${srcmainfile} ${objfile} object {debug c++}] != ""
++     || [gdb_compile ${objfile} ${binfile} executable {debug c++ shlib_load}] != "" } {
++    return -1
++}
++
++clean_restart ${executable}
++
++if { ![runto_main] } {
++    return -1
++}
++
++for {set i 0} {$i < 10} {incr i} {
++    gdb_test "p openlib (\"${libfile}\")" " = 1" "test $i"
++    # https://bugzilla.redhat.com/bugzilla/show_bug.cgi?id=660197
++    gdb_test "info program" "\r\nProgram stopped at .*\r\nIt stopped at breakpoint 1\\." "test $i info program"
++    # Try to exploit the GDB trashed memory.
++    gdb_test "b openlib" {Breakpoint [0-9]+ at .*} "test $i stub 1"
++    gdb_test {delete $bpnum} "" "test $i stub 2"
++}

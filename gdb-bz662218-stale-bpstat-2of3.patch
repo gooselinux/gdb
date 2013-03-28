@@ -1,0 +1,776 @@
+
+commit 043822a615f37ecb759463136ee557720c4a9fac
+Author: Pedro Alves <pedro@codesourcery.com>
+Date:   Tue Aug 17 20:59:01 2010 +0000
+
+    gdb/
+    2010-08-17  Pedro Alves  <pedro@codesourcery.com>
+
+        PR breakpoints/11371
+
+        * breakpoint.c (breakpoint_init_inferior): Decrement the
+        location's reference count instead of deleting right away.
+        (bpstat_free): Decrement the location's reference count.  Make
+        static.
+        (bpstat_copy): Increment the location's reference count.
+        (bpstat_find_breakpoint): Adjust.
+        (bpstat_num): Adjust.
+        (print_it_typical): Adjust.  Use the breakpoint pointer in the
+        bpstat instead of the location's owner.
+        (bpstat_alloc): Remove const qualifier from the 'bl' parameter.
+        Adjust to record the location's owner in the bpstat.
+        (watchpoint_check): Use the breakpoint pointer in the bpstat
+        instead of the location's owner.
+        (bpstat_check_breakpoint_conditions): Don't handle
+        bp_watchpoint_scope here.  Use the breakpoint pointer in the
+        bpstat instead of the location's owner.
+        (bpstat_stop_status): Defer inferior function calls to after
+        building the bpstat list.  Handle bp_watchpoint_scope here.  Use
+        the breakpoint pointer in the bpstat instead of the location's
+        owner.
+        (bpstat_what): Use the breakpoint pointer in the bpstat instead of
+        the location's owner.
+        (free_bp_location): Don't walk bpstats clearing locations.
+        (incref_bp_location): New.
+        (decref_bp_location): New.
+        (breakpoint_auto_delete): Use the breakpoint pointer in the bpstat
+        instead of the location's owner.
+        (update_global_location_list): Clear the location's owner, and
+        decrement the location's reference count instead of deleting it
+        right away.
+        (breakpoint_retire_moribund): Decrement the location's reference
+        count instead of deleting it right away.
+        (bpstat_remove_bp_location): Delete.
+        (bpstat_remove_breakpoint): New.
+        (bpstat_remove_bp_location_callback): Delete.
+        (bpstat_remove_breakpoint_callback): New.
+        (delete_breakpoint): Iterate over all threads' stop_bpstat's
+        clearing references to the breakpoint that is being deleted.
+
+        * breakpoint.h (struct bp_location) <refc>: New field.
+        <owner>: Update comments.
+        (bpstat_free): Delete declaration.
+        (struct bpstats): Change the type of the breakpoint_at field to
+        struct breakpoint point, from struct bp_location pointer.  Add new
+        field bp_location_at.
+
+    gdb/testsuite/
+    2010-08-17  Jan Kratochvil  <jan.kratochvil@redhat.com>
+            Pedro Alves  <pedro@codesourcery.com>
+
+        PR breakpoints/11371
+
+        * gdb.base/watch-cond-infcall.exp: New file.
+        * gdb.base/watch-cond-infcall.c: New file.
+
+--- ./gdb/breakpoint.c	2010-12-10 08:00:53.000000000 +0100
++++ ./gdb/breakpoint.c	2010-12-10 14:13:16.000000000 +0100
+@@ -132,7 +132,7 @@ static void breakpoints_info (char *, in
+ 
+ static void breakpoint_1 (int, int);
+ 
+-static bpstat bpstat_alloc (const struct bp_location *, bpstat);
++static bpstat bpstat_alloc (struct bp_location *, bpstat);
+ 
+ static int breakpoint_cond_eval (void *);
+ 
+@@ -199,6 +199,8 @@ static int single_step_breakpoint_insert
+ 						   CORE_ADDR pc);
+ 
+ static void free_bp_location (struct bp_location *loc);
++static void incref_bp_location (struct bp_location *loc);
++static void decref_bp_location (struct bp_location **loc);
+ 
+ static struct bp_location *allocate_bp_location (struct breakpoint *bpt);
+ 
+@@ -2310,7 +2312,7 @@ breakpoint_init_inferior (enum inf_conte
+ 
+   /* Get rid of the moribund locations.  */
+   for (ix = 0; VEC_iterate (bp_location_p, moribund_locations, ix, bpt); ++ix)
+-    free_bp_location (bpt);
++    decref_bp_location (&bpt);
+   VEC_free (bp_location_p, moribund_locations);
+ }
+ 
+@@ -2559,12 +2561,16 @@ ep_is_catchpoint (struct breakpoint *ep)
+   return (ep->type == bp_catchpoint);
+ }
+ 
+-void 
++/* Frees any storage that is part of a bpstat.  Does not walk the
++   'next' chain.  */
++
++static void
+ bpstat_free (bpstat bs)
+ {
+   if (bs->old_val != NULL)
+     value_free (bs->old_val);
+   free_command_lines (&bs->commands);
++  decref_bp_location (&bs->bp_location_at);
+   xfree (bs);
+ }
+ 
+@@ -2608,6 +2614,7 @@ bpstat_copy (bpstat bs)
+       memcpy (tmp, bs, sizeof (*tmp));
+       if (bs->commands != NULL)
+ 	tmp->commands = copy_command_lines (bs->commands);
++      incref_bp_location (tmp->bp_location_at);
+       if (bs->old_val != NULL)
+ 	{
+ 	  tmp->old_val = value_copy (bs->old_val);
+@@ -2635,7 +2642,7 @@ bpstat_find_breakpoint (bpstat bsp, stru
+ 
+   for (; bsp != NULL; bsp = bsp->next)
+     {
+-      if (bsp->breakpoint_at && bsp->breakpoint_at->owner == breakpoint)
++      if (bsp->breakpoint_at == breakpoint)
+ 	return bsp;
+     }
+   return NULL;
+@@ -2661,10 +2668,10 @@ bpstat_find_step_resume_breakpoint (bpst
+   for (; bsp != NULL; bsp = bsp->next)
+     {
+       if ((bsp->breakpoint_at != NULL)
+-	  && (bsp->breakpoint_at->owner->type == bp_step_resume)
+-	  && (bsp->breakpoint_at->owner->thread == current_thread
+-	      || bsp->breakpoint_at->owner->thread == -1))
+-	return bsp->breakpoint_at->owner;
++	  && (bsp->breakpoint_at->type == bp_step_resume)
++	  && (bsp->breakpoint_at->thread == current_thread
++	      || bsp->breakpoint_at->thread == -1))
++	return bsp->breakpoint_at;
+     }
+ 
+   internal_error (__FILE__, __LINE__, _("No step_resume breakpoint found."));
+@@ -2692,7 +2699,7 @@ bpstat_num (bpstat *bsp, int *num)
+      correspond to a single breakpoint -- otherwise, 
+      this function might return the same number more
+      than once and this will look ugly.  */
+-  b = (*bsp)->breakpoint_at ? (*bsp)->breakpoint_at->owner : NULL;
++  b = (*bsp)->breakpoint_at;
+   *bsp = (*bsp)->next;
+   if (b == NULL)
+     return -1;			/* breakpoint that's been deleted since */
+@@ -2899,13 +2906,11 @@ print_it_typical (bpstat bs)
+      which has since been deleted.  */
+   if (bs->breakpoint_at == NULL)
+     return PRINT_UNKNOWN;
+-  bl = bs->breakpoint_at;
+ 
+-  /* bl->owner can be NULL if it was a momentary breakpoint
+-     which has since been placed into moribund_locations.  */
+-  if (bl->owner == NULL)
+-    return PRINT_UNKNOWN;
+-  b = bl->owner;
++  gdb_assert (bs->bp_location_at != NULL);
++
++  bl = bs->bp_location_at;
++  b = bs->breakpoint_at;
+ 
+   stb = ui_out_stream_new (uiout);
+   old_chain = make_cleanup_ui_out_stream_delete (stb);
+@@ -2914,7 +2919,7 @@ print_it_typical (bpstat bs)
+     {
+     case bp_breakpoint:
+     case bp_hardware_breakpoint:
+-      bp_temp = bs->breakpoint_at->owner->disposition == disp_del;
++      bp_temp = b->disposition == disp_del;
+       if (bl->address != bl->requested_address)
+ 	breakpoint_adjustment_warning (bl->requested_address,
+ 	                               bl->address,
+@@ -3096,9 +3101,8 @@ print_bp_stop_message (bpstat bs)
+ 
+     case print_it_normal:
+       {
+-	const struct bp_location *bl = bs->breakpoint_at;
+-	struct breakpoint *b = bl ? bl->owner : NULL;
+-	
++	struct breakpoint *b = bs->breakpoint_at;
++
+ 	/* Normal case.  Call the breakpoint's print_it method, or
+ 	   print_it_typical.  */
+ 	/* FIXME: how breakpoint can ever be NULL here?  */
+@@ -3176,13 +3180,15 @@ breakpoint_cond_eval (void *exp)
+ /* Allocate a new bpstat and chain it to the current one.  */
+ 
+ static bpstat
+-bpstat_alloc (const struct bp_location *bl, bpstat cbs /* Current "bs" value */ )
++bpstat_alloc (struct bp_location *bl, bpstat cbs /* Current "bs" value */ )
+ {
+   bpstat bs;
+ 
+   bs = (bpstat) xmalloc (sizeof (*bs));
+   cbs->next = bs;
+-  bs->breakpoint_at = bl;
++  bs->breakpoint_at = bl->owner;
++  bs->bp_location_at = bl;
++  incref_bp_location (bl);
+   /* If the condition is false, etc., don't do the commands.  */
+   bs->commands = NULL;
+   bs->old_val = NULL;
+@@ -3279,10 +3285,9 @@ watchpoint_check (void *p)
+   struct frame_info *fr;
+   int within_current_scope;
+ 
+-  /* BS is built for existing struct breakpoint.  */
++  /* BS is built from an existing struct breakpoint.  */
+   gdb_assert (bs->breakpoint_at != NULL);
+-  gdb_assert (bs->breakpoint_at->owner != NULL);
+-  b = bs->breakpoint_at->owner;
++  b = bs->breakpoint_at;
+ 
+   /* If this is a local watchpoint, we only want to check if the
+      watchpoint frame is in scope if the current thread is the thread
+@@ -3479,9 +3484,9 @@ bpstat_check_watchpoint (bpstat bs)
+   struct breakpoint *b;
+ 
+   /* BS is built for existing struct breakpoint.  */
+-  bl = bs->breakpoint_at;
++  bl = bs->bp_location_at;
+   gdb_assert (bl != NULL);
+-  b = bl->owner;
++  b = bs->breakpoint_at;
+   gdb_assert (b != NULL);
+ 
+   if (b->type == bp_watchpoint
+@@ -3577,6 +3582,7 @@ bpstat_check_watchpoint (bpstat bs)
+ /* Check conditions (condition proper, frame, thread and ignore count)
+    of breakpoint referred to by BS.  If we should not stop for this
+    breakpoint, set BS->stop to 0.  */
++
+ static void
+ bpstat_check_breakpoint_conditions (bpstat bs, ptid_t ptid)
+ {
+@@ -3585,9 +3591,9 @@ bpstat_check_breakpoint_conditions (bpst
+   struct breakpoint *b;
+ 
+   /* BS is built for existing struct breakpoint.  */
+-  bl = bs->breakpoint_at;
++  bl = bs->bp_location_at;
+   gdb_assert (bl != NULL);
+-  b = bl->owner;
++  b = bs->breakpoint_at;
+   gdb_assert (b != NULL);
+ 
+   if (frame_id_p (b->frame_id)
+@@ -3597,14 +3603,7 @@ bpstat_check_breakpoint_conditions (bpst
+     {
+       int value_is_zero = 0;
+       
+-      /* If this is a scope breakpoint, mark the associated
+-	 watchpoint as triggered so that we will handle the
+-	 out-of-scope event.  We'll get to the watchpoint next
+-	 iteration.  */
+-      if (b->type == bp_watchpoint_scope)
+-	b->related_breakpoint->watchpoint_triggered = watch_triggered_yes;
+-      
+-      if (bl->cond && bl->owner->disposition != disp_del_at_next_stop)
++      if (bl->cond && bl->owner && bl->owner->disposition != disp_del_at_next_stop)
+ 	{
+ 	  /* We use value_mark and value_free_to_mark because it could
+ 	     be a long time before we return to the command level and
+@@ -3678,10 +3677,15 @@ bpstat_stop_status (struct address_space
+   bpstat bs = root_bs;
+   int ix;
+   int need_remove_insert;
++  int removed_any;
++  bpstat bs_prev;
+ 
+-  /* ALL_BP_LOCATIONS iteration would break across
+-     update_global_location_list possibly executed by
+-     bpstat_check_breakpoint_conditions's inferior call.  */
++  /* First, build the bpstat chain with locations that explain a
++     target stop, while being careful to not set the target running,
++     as that may invalidate locations (in particular watchpoint
++     locations are recreated).  Resuming will happen here with
++     breakpoint conditions or watchpoint expressions that include
++     inferior function calls.  */
+ 
+   ALL_BREAKPOINTS (b)
+     {
+@@ -3690,8 +3694,6 @@ bpstat_stop_status (struct address_space
+ 
+       for (bl = b->loc; bl != NULL; bl = bl->next)
+ 	{
+-	  bpstat bs_prev = bs;
+-
+ 	  /* For hardware watchpoints, we look only at the first location.
+ 	     The watchpoint_check function will work on entire expression,
+ 	     not the individual locations.  For read watchopints, the
+@@ -3709,27 +3711,66 @@ bpstat_stop_status (struct address_space
+ 	  /* Come here if it's a watchpoint, or if the break address matches */
+ 
+ 	  bs = bpstat_alloc (bl, bs);	/* Alloc a bpstat to explain stop */
+-	  gdb_assert (bs_prev->next == bs);
+ 
+-	  /* Assume we stop.  Should we find watchpoint that is not actually
+-	     triggered, or if condition of breakpoint is false, we'll reset
+-	     'stop' to 0.  */
++	  /* Assume we stop.  Should we find a watchpoint that is not
++	     actually triggered, or if the condition of the breakpoint
++	     evaluates as false, we'll reset 'stop' to 0.  */
+ 	  bs->stop = 1;
+ 	  bs->print = 1;
+ 
+-	  if (!bpstat_check_watchpoint (bs))
++	  /* If this is a scope breakpoint, mark the associated
++	     watchpoint as triggered so that we will handle the
++	     out-of-scope event.  We'll get to the watchpoint next
++	     iteration.  */
++	  if (b->type == bp_watchpoint_scope)
++	    b->related_breakpoint->watchpoint_triggered = watch_triggered_yes;
++	}
++    }
++
++  for (ix = 0; VEC_iterate (bp_location_p, moribund_locations, ix, loc); ++ix)
++    {
++      if (breakpoint_address_match (loc->pspace->aspace, loc->address,
++				    aspace, bp_addr))
++	{
++	  bs = bpstat_alloc (loc, bs);
++	  /* For hits of moribund locations, we should just proceed.  */
++	  bs->stop = 0;
++	  bs->print = 0;
++	  bs->print_it = print_it_noop;
++	}
++    }
++
++  /* Terminate the chain.  */
++  bs->next = NULL;
++
++  /* Now go through the locations that caused the target to stop, and
++     check whether we're interested in reporting this stop to higher
++     layers, or whether we should resume the target transparently.  */
++
++  removed_any = 0;
++
++  bs_prev = root_bs;
++  for (bs = root_bs->next; bs != NULL; bs_prev = bs, bs = bs->next)
++    {
++      if (!bs->stop)
++	continue;
++
++	  if (!bpstat_check_watchpoint (bs) && bs->print_it == print_it_noop
++	      && !bs->stop)
+ 	    {
+ 	      /* Ensure bpstat_explains_signal stays false if this BL could not be
+ 		 the cause of this trap.  */
+ 
+-	      gdb_assert (bs->print_it == print_it_noop);
+-	      gdb_assert (!bs->stop);
++//	      gdb_assert (bs->print_it == print_it_noop);
++//	      gdb_assert (!bs->stop);
++	      bs_prev->next = bs->next;
+ 	      xfree (bs);
+ 	      bs = bs_prev;
+-	      bs->next = NULL;
+ 	      continue;
+ 	    }
+ 
++      b = bs->breakpoint_at;
++
+ 	  if (b->type == bp_thread_event || b->type == bp_overlay_event
+ 	      || b->type == bp_longjmp_master
+ 	      || b->type == bp_exception_master)
+@@ -3737,7 +3778,7 @@ bpstat_stop_status (struct address_space
+ 	    bs->stop = 0;
+ 	  else
+ 	    bpstat_check_breakpoint_conditions (bs, ptid);
+-	
++
+ 	  if (bs->stop)
+ 	    {
+ 	      ++(b->hit_count);
+@@ -3747,7 +3788,7 @@ bpstat_stop_status (struct address_space
+ 		{
+ 		  if (b->enable_state != bp_permanent)
+ 		    b->enable_state = bp_disabled;
+-		  update_global_location_list (0);
++		  removed_any = 1;
+ 		}
+ 	      if (b->silent)
+ 		bs->print = 0;
+@@ -3766,24 +3807,8 @@ bpstat_stop_status (struct address_space
+ 	  /* Print nothing for this entry if we dont stop or dont print.  */
+ 	  if (bs->stop == 0 || bs->print == 0)
+ 	    bs->print_it = print_it_noop;
+-	}
+     }
+ 
+-  for (ix = 0; VEC_iterate (bp_location_p, moribund_locations, ix, loc); ++ix)
+-    {
+-      if (breakpoint_address_match (loc->pspace->aspace, loc->address,
+-				    aspace, bp_addr))
+-	{
+-	  bs = bpstat_alloc (loc, bs);
+-	  /* For hits of moribund locations, we should just proceed.  */
+-	  bs->stop = 0;
+-	  bs->print = 0;
+-	  bs->print_it = print_it_noop;
+-	}
+-    }
+-
+-  bs->next = NULL;		/* Terminate the chain */
+-
+   /* If we aren't stopping, the value of some hardware watchpoint may
+      not have changed, but the intermediate memory locations we are
+      watching may have.  Don't bother if we're stopping; this will get
+@@ -3796,18 +3821,17 @@ bpstat_stop_status (struct address_space
+   if (bs == NULL)
+     for (bs = root_bs->next; bs != NULL; bs = bs->next)
+       if (!bs->stop
+-	  && bs->breakpoint_at->owner
+-	  && is_hardware_watchpoint (bs->breakpoint_at->owner))
++	  && bs->breakpoint_at
++	  && is_hardware_watchpoint (bs->breakpoint_at))
+ 	{
+-	  update_watchpoint (bs->breakpoint_at->owner, 0 /* don't reparse. */);
+-	  /* Updating watchpoints invalidates bs->breakpoint_at.
+-	     Prevent further code from trying to use it.  */
+-	  bs->breakpoint_at = NULL;
++	  update_watchpoint (bs->breakpoint_at, 0 /* don't reparse. */);
+ 	  need_remove_insert = 1;
+ 	}
+ 
+   if (need_remove_insert)
+     update_global_location_list (1);
++  else if (removed_any)
++    update_global_location_list (0);
+ 
+   return root_bs->next;
+ }
+@@ -3949,10 +3973,10 @@ bpstat_what (bpstat bs)
+ 	/* I suspect this can happen if it was a momentary breakpoint
+ 	   which has since been deleted.  */
+ 	continue;
+-      if (bs->breakpoint_at->owner == NULL)
++      if (bs->breakpoint_at == NULL)
+ 	bs_class = bp_nostop;
+       else
+-      switch (bs->breakpoint_at->owner->type)
++      switch (bs->breakpoint_at->type)
+ 	{
+ 	case bp_none:
+ 	  continue;
+@@ -3990,13 +4014,13 @@ bpstat_what (bpstat bs)
+ 	case bp_longjmp:
+ 	case bp_exception:
+ 	  bs_class = long_jump;
+-	  retval.is_longjmp = bs->breakpoint_at->owner->type == bp_longjmp;
++	  retval.is_longjmp = bs->breakpoint_at->type == bp_longjmp;
+ 	  break;
+ 	case bp_longjmp_resume:
+ 	case bp_exception_resume:
+ 	  bs_class = long_resume;
+ 	  retval.is_longjmp
+-	    = bs->breakpoint_at->owner->type == bp_longjmp_resume;
++	    = bs->breakpoint_at->type == bp_longjmp_resume;
+ 	  break;
+ 	case bp_step_resume:
+ 	  if (bs->stop)
+@@ -4987,20 +5011,41 @@ allocate_bp_location (struct breakpoint 
+       internal_error (__FILE__, __LINE__, _("unknown breakpoint type"));
+     }
+ 
++  loc->refc = 1;
+   return loc;
+ }
+ 
+-static void free_bp_location (struct bp_location *loc)
++static void
++free_bp_location (struct bp_location *loc)
+ {
+   if (loc->cond)
+     xfree (loc->cond);
+ 
+   if (loc->function_name)
+     xfree (loc->function_name);
+-  
++
+   xfree (loc);
+ }
+ 
++/* Increment reference count.  */
++
++static void
++incref_bp_location (struct bp_location *bl)
++{
++  ++bl->refc;
++}
++
++/* Decrement reference count.  If the reference count reaches 0,
++   destroy the bp_location.  Sets *BLP to NULL.  */
++
++static void
++decref_bp_location (struct bp_location **blp)
++{
++  if (--(*blp)->refc == 0)
++    free_bp_location (*blp);
++  *blp = NULL;
++}
++
+ /* Helper to set_raw_breakpoint below.  Creates a breakpoint
+    that has type BPTYPE and has no locations as yet.  */
+ /* This function is used in gdbtk sources and thus can not be made static.  */
+@@ -8442,11 +8487,10 @@ breakpoint_auto_delete (bpstat bs)
+   struct breakpoint *b, *temp;
+ 
+   for (; bs; bs = bs->next)
+-    if (bs->breakpoint_at 
+-	&& bs->breakpoint_at->owner
+-	&& bs->breakpoint_at->owner->disposition == disp_del
++    if (bs->breakpoint_at
++	&& bs->breakpoint_at->disposition == disp_del
+ 	&& bs->stop)
+-      delete_breakpoint (bs->breakpoint_at->owner);
++      delete_breakpoint (bs->breakpoint_at);
+ 
+   ALL_BREAKPOINTS_SAFE (b, temp)
+   {
+@@ -8749,7 +8793,10 @@ update_global_location_list (int should_
+ 	      VEC_safe_push (bp_location_p, moribund_locations, old_loc);
+ 	    }
+ 	  else
+-	    free_bp_location (old_loc);
++	    {
++	      old_loc->owner = NULL;
++	      decref_bp_location (&old_loc);
++	    }
+ 	}
+     }
+ 
+@@ -8832,7 +8879,7 @@ breakpoint_retire_moribund (void)
+   for (ix = 0; VEC_iterate (bp_location_p, moribund_locations, ix, loc); ++ix)
+     if (--(loc->events_till_retirement) == 0)
+       {
+-	free_bp_location (loc);
++	decref_bp_location (&loc);
+ 	VEC_unordered_remove (bp_location_p, moribund_locations, ix);
+ 	--ix;
+       }
+@@ -8851,8 +8898,9 @@ static void
+ bpstat_remove_breakpoint (bpstat bps, struct breakpoint *bpt)
+ {
+   bpstat bs;
++
+   for (bs = bps; bs; bs = bs->next)
+-    if (bs->breakpoint_at && bs->breakpoint_at->owner == bpt)
++    if (bs->breakpoint_at == bpt)
+       {
+ 	bs->breakpoint_at = NULL;
+ 	bs->old_val = NULL;
+@@ -8865,6 +8913,7 @@ static int
+ bpstat_remove_breakpoint_callback (struct thread_info *th, void *data)
+ {
+   struct breakpoint *bpt = data;
++
+   bpstat_remove_breakpoint (th->stop_bpstat, bpt);
+   return 0;
+ }
+@@ -8947,6 +8996,19 @@ delete_breakpoint (struct breakpoint *bp
+ 
+   iterate_over_threads (bpstat_remove_breakpoint_callback, bpt);
+ 
++
++  /* Be sure no bpstat's are pointing at the breakpoint after it's
++     been freed.  */
++  /* FIXME, how can we find all bpstat's?  We just check stop_bpstat
++     in all threeds for now.  Note that we cannot just remove bpstats
++     pointing at bpt from the stop_bpstat list entirely, as breakpoint
++     commands are associated with the bpstat; if we remove it here,
++     then the later call to bpstat_do_actions (&stop_bpstat); in
++     event-top.c won't do anything, and temporary breakpoints with
++     commands won't work.  */
++
++  iterate_over_threads (bpstat_remove_breakpoint_callback, bpt);
++
+   /* Now that breakpoint is removed from breakpoint
+      list, update the global location list.  This
+      will remove locations that used to belong to
+--- ./gdb/breakpoint.h	2010-12-10 07:52:17.000000000 +0100
++++ ./gdb/breakpoint.h	2010-12-10 14:02:16.000000000 +0100
+@@ -242,12 +242,18 @@ struct bp_location
+      the same parent breakpoint.  */
+   struct bp_location *next;
+ 
++  /* The reference count.  */
++  int refc;
++
+   /* Type of this breakpoint location.  */
+   enum bp_loc_type loc_type;
+ 
+   /* Each breakpoint location must belong to exactly one higher-level
+-     breakpoint.  This and the DUPLICATE flag are more straightforward
+-     than reference counting.  */
++     breakpoint.  This pointer is NULL iff this bp_location is no
++     longer attached to a breakpoint.  For example, when a breakpoint
++     is deleted, its locations may still be found in the
++     moribund_locations list, or if we had stopped for it, in
++     bpstats.  */
+   struct breakpoint *owner;
+ 
+   /* Conditional.  Break only if this expression's value is nonzero.  
+@@ -537,10 +543,6 @@ DEF_VEC_P(breakpoint_p);
+ 
+ typedef struct bpstats *bpstat;
+ 
+-/* Frees any storage that is part of a bpstat.
+-   Does not walk the 'next' chain.  */
+-extern void bpstat_free (bpstat);
+-
+ /* Clears a chain of bpstat, freeing storage
+    of each.  */
+ extern void bpstat_clear (bpstat *);
+@@ -703,13 +705,37 @@ enum bp_print_how
+ 
+ struct bpstats
+   {
+-    /* Linked list because there can be two breakpoints at the same
+-       place, and a bpstat reflects the fact that both have been hit.  */
++    /* Linked list because there can be more than one breakpoint at
++       the same place, and a bpstat reflects the fact that all have
++       been hit.  */
+     bpstat next;
+-    /* Breakpoint that we are at.  */
+-    const struct bp_location *breakpoint_at;
++
++    /* Location that caused the stop.  Locations are refcounted, so
++       this will never be NULL.  Note that this location may end up
++       detached from a breakpoint, but that does not necessary mean
++       that the struct breakpoint is gone.  E.g., consider a
++       watchpoint with a condition that involves an inferior function
++       call.  Watchpoint locations are recreated often (on resumes,
++       hence on infcalls too).  Between creating the bpstat and after
++       evaluating the watchpoint condition, this location may hence
++       end up detached from its original owner watchpoint, even though
++       the watchpoint is still listed.  If it's condition evaluates as
++       true, we still want this location to cause a stop, and we will
++       still need to know which watchpoint it was originally attached.
++       What this means is that we should not (in most cases) follow
++       the `bpstat->bp_location->owner' link, but instead use the
++       `breakpoint_at' field below.  */
++    struct bp_location *bp_location_at;
++
++    /* Breakpoint that caused the stop.  This is nullified if the
++       breakpoint ends up being deleted.  See comments on
++       `bp_location_at' above for why do we need this field instead of
++       following the location's owner.  */
++    struct breakpoint *breakpoint_at;
++
+     /* Commands left to be done.  */
+     struct command_line *commands;
++
+     /* Old value associated with a watchpoint.  */
+     struct value *old_val;
+ 
+--- ./gdb/infcall.c	2010-12-10 07:52:17.000000000 +0100
++++ ./gdb/infcall.c	2010-12-10 14:12:59.000000000 +0100
+@@ -967,7 +967,7 @@ When the function is done executing, GDB
+ 		 user.  */
+ 
+ 	      if (terminate_bp_num != 0
+-		  && (inferior_thread ()->stop_bpstat->breakpoint_at->address
++		  && (inferior_thread ()->stop_bpstat->bp_location_at->address
+ 		      == terminate_bp_addr))
+ 		{
+ 		  /* We must get back to the frame we were before the
+--- ./gdb/testsuite/gdb.base/watch-cond-infcall.c	1970-01-01 01:00:00.000000000 +0100
++++ ./gdb/testsuite/gdb.base/watch-cond-infcall.c	2010-12-10 08:03:16.000000000 +0100
+@@ -0,0 +1,33 @@
++/* This testcase is part of GDB, the GNU debugger.
++
++   Copyright 2010 Free Software Foundation, Inc.
++
++   This program is free software; you can redistribute it and/or modify
++   it under the terms of the GNU General Public License as published by
++   the Free Software Foundation; either version 3 of the License, or
++   (at your option) any later version.
++
++   This program is distributed in the hope that it will be useful,
++   but WITHOUT ANY WARRANTY; without even the implied warranty of
++   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++   GNU General Public License for more details.
++
++   You should have received a copy of the GNU General Public License
++   along with this program.  If not, see <http://www.gnu.org/licenses/>.  */
++
++volatile int var;
++
++int
++return_1 (void)
++{
++  return 1;
++}
++
++int
++main(void)
++{
++  var++;
++  var++;	/* watchpoint-stop */
++
++  return 0;     /* break-at-exit */
++}
+--- ./gdb/testsuite/gdb.base/watch-cond-infcall.exp	1970-01-01 01:00:00.000000000 +0100
++++ ./gdb/testsuite/gdb.base/watch-cond-infcall.exp	2010-12-10 08:03:16.000000000 +0100
+@@ -0,0 +1,61 @@
++# Copyright 2010 Free Software Foundation, Inc.
++
++# This program is free software; you can redistribute it and/or modify
++# it under the terms of the GNU General Public License as published by
++# the Free Software Foundation; either version 3 of the License, or
++# (at your option) any later version.
++#
++# This program is distributed in the hope that it will be useful,
++# but WITHOUT ANY WARRANTY; without even the implied warranty of
++# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++# GNU General Public License for more details.
++#
++# You should have received a copy of the GNU General Public License
++# along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++# Test for watchpoints with conditions that involve inferior function
++# calls.
++
++set testfile "watch-cond-infcall"
++set srcfile ${testfile}.c
++set binfile ${objdir}/${subdir}/${testfile}
++
++if { [build_executable ${testfile}.exp ${testfile} ${testfile}.c {debug}] } {
++    untested ${testfile}.exp
++    return -1
++}
++
++proc test_watchpoint { hw teststr } {
++    global testfile
++    global pf_prefix
++
++    set old_pf_prefix $pf_prefix
++    lappend pf_prefix "$teststr:"
++
++    clean_restart ${testfile}
++
++    if { ![runto main] } then {
++	fail "run to main"
++	return
++    }
++
++    if { ! $hw } {
++	gdb_test "set can-use-hw-watchpoints 0" ".*" ""
++    }
++
++    gdb_test "watch var if return_1 ()" "atchpoint .*: var"
++
++    gdb_breakpoint [gdb_get_line_number "break-at-exit"]
++
++    gdb_test "continue" \
++	"atchpoint \[0-9\]+: var\r\n\r\nOld value = 0\r\nNew value = 1\r\n.*watchpoint-stop.*" \
++	"continue"
++
++    set pf_prefix $old_pf_prefix
++}
++
++if { ![target_info exists gdb,no_hardware_watchpoints] } {
++    test_watchpoint 1 "hw"
++}
++
++test_watchpoint 0 "sw"
